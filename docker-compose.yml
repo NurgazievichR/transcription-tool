@@ -1,0 +1,9 @@
+services:
+  transcription:
+    build: .
+    container_name: transcription
+    restart: unless-stopped
+    ports:
+      - "8510:8510"
+    env_file:
+      - .env
