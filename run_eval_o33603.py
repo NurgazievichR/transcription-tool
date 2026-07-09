@@ -39,7 +39,8 @@ def _load_or_transcribe(retranscribe: bool, on_progress) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Evaluate raw vs GPT-corrected diarization")
     parser.add_argument("--retranscribe", action="store_true", help="Re-run AssemblyAI instead of cache")
-    parser.add_argument("--confidence", type=float, default=0.75, help="LLM correction threshold")
+    parser.add_argument("--confidence", type=float, default=0.80, help="Split threshold")
+    parser.add_argument("--flip-confidence", type=float, default=0.88, help="Label-fix threshold")
     parser.add_argument("--expected-speakers", type=int, default=2, help="Hint for LLM")
     args = parser.parse_args()
 
@@ -73,17 +74,19 @@ def main():
         raw_utterances,
         expected_speakers=args.expected_speakers,
     )
-    corrected_utterances, split_logs, flips = postprocess_transcript(
+    corrected_utterances, split_logs, flips, rejected_flips = postprocess_transcript(
         raw_utterances,
         llm_result,
         confidence_threshold=args.confidence,
+        correction_confidence_threshold=args.flip_confidence,
         enable_splits=True,
         enable_corrections=True,
     )
     applied_splits = sum(1 for s in split_logs if s.get("status") == "applied")
     print(
         f"LLM splits proposed {len(llm_result.get('splits', []))}, applied {applied_splits}; "
-        f"label fixes proposed {len(llm_result.get('corrections', []))}, applied {len(flips)}"
+        f"label fixes proposed {len(llm_result.get('corrections', []))}, "
+        f"applied {len(flips)}, rejected {len(rejected_flips)}"
     )
 
     (OUT_DIR / "llm_corrections.json").write_text(
@@ -94,6 +97,9 @@ def main():
     )
     (OUT_DIR / "speaker_flips.json").write_text(
         json.dumps(flips, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    (OUT_DIR / "speaker_flips_rejected.json").write_text(
+        json.dumps(rejected_flips, ensure_ascii=False, indent=2), encoding="utf-8",
     )
 
     raw_metrics = evaluate_variant(ref, raw_utterances)
@@ -113,7 +119,8 @@ def main():
         "",
         table,
         "",
-        f"GPT flips applied (confidence >= {args.confidence:.0%}): {len(flips)}",
+        f"GPT flips applied (split ≥ {args.confidence:.0%}, flip ≥ {args.flip_confidence:.0%}): {len(flips)}",
+        f"GPT flips rejected: {len(rejected_flips)}",
         "",
         "Sample flips:",
     ])

@@ -87,12 +87,22 @@ with st.sidebar:
         help="Flip Speaker A/B where dialogue context suggests the label is wrong.",
     )
     gpt_confidence = st.slider(
-        "GPT confidence threshold",
+        "GPT split threshold",
         min_value=0.5,
         max_value=1.0,
-        value=0.75,
+        value=0.80,
         step=0.05,
         disabled=not enable_gpt,
+        help="Minimum confidence to split a merged utterance.",
+    )
+    gpt_flip_confidence = st.slider(
+        "GPT label-fix threshold",
+        min_value=0.5,
+        max_value=1.0,
+        value=0.88,
+        step=0.05,
+        disabled=not enable_gpt or not enable_gpt_corrections,
+        help="Higher bar for flipping a whole utterance — reduces false corrections.",
     )
 
     st.divider()
@@ -165,6 +175,7 @@ if run:
             corrected_utterances = raw_utterances
             flips: list[dict] = []
             split_logs: list[dict] = []
+            rejected_flips: list[dict] = []
 
             if enable_gpt and azure_ok:
                 status.write("**[GPT] Reviewing transcript (splits + speaker labels)...**")
@@ -174,10 +185,11 @@ if run:
                     expected_speakers=expected_for_gpt,
                     config=load_azure_openai_config(),
                 )
-                corrected_utterances, split_logs, flips = postprocess_transcript(
+                corrected_utterances, split_logs, flips, rejected_flips = postprocess_transcript(
                     raw_utterances,
                     llm_result,
                     confidence_threshold=gpt_confidence,
+                    correction_confidence_threshold=gpt_flip_confidence,
                     enable_splits=enable_gpt_splits,
                     enable_corrections=enable_gpt_corrections,
                 )
@@ -186,7 +198,8 @@ if run:
                     f"GPT splits: proposed **{len(llm_result.get('splits', []))}**, "
                     f"applied **{applied_splits}** | "
                     f"label fixes: proposed **{len(llm_result.get('corrections', []))}**, "
-                    f"applied **{len(flips)}** (threshold {gpt_confidence:.0%})"
+                    f"applied **{len(flips)}**, rejected **{len(rejected_flips)}** "
+                    f"(split ≥{gpt_confidence:.0%}, flip ≥{gpt_flip_confidence:.0%})"
                 )
 
         status.update(label="Complete", state="complete", expanded=False)
@@ -203,6 +216,7 @@ if run:
             "corrected_utterances": corrected_utterances,
             "flips": flips,
             "split_logs": split_logs,
+            "rejected_flips": rejected_flips,
             "gpt_enabled": enable_gpt and azure_ok,
         }
 
@@ -217,6 +231,7 @@ def _render_transcript_results(data: dict) -> None:
     corrected_utterances = data["corrected_utterances"]
     flips = data["flips"]
     split_logs = data["split_logs"]
+    rejected_flips = data.get("rejected_flips", [])
     gpt_enabled = data["gpt_enabled"]
 
     cols = st.columns(5 if gpt_enabled else 4)
@@ -254,13 +269,20 @@ def _render_transcript_results(data: dict) -> None:
                         f"- **#{item['utterance_id']}** → **{item['to_utterances']}** parts "
                         f"({item['confidence']:.0%}) — {item.get('reason', '')}"
                     )
-        if flips:
-            with st.expander(f"Speaker label changes ({len(flips)})"):
-                for flip in flips:
-                    st.markdown(
-                        f"- **#{flip['utterance_id']}**: {flip['from']} → {flip['to']} "
-                        f"({flip['confidence']:.0%}) — {flip.get('reason', '')}"
-                    )
+            if flips:
+                with st.expander(f"Speaker label changes ({len(flips)})"):
+                    for flip in flips:
+                        st.markdown(
+                            f"- **#{flip['utterance_id']}**: {flip['from']} → {flip['to']} "
+                            f"({flip['confidence']:.0%}) — {flip.get('reason', '')}"
+                        )
+            if rejected_flips:
+                with st.expander(f"Rejected label fixes ({len(rejected_flips)})"):
+                    for item in rejected_flips[:20]:
+                        st.markdown(
+                            f"- **#{item['utterance_id']}**: {item.get('reject_reason', 'rejected')} "
+                            f"({item.get('confidence', 0):.0%})"
+                        )
 
     stem = Path(data["filename"]).stem
     export = _utterances_to_export(active, meta, variant=view)

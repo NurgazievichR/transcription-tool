@@ -12,16 +12,21 @@ from transcript_format import format_numbered_transcript, letter_to_speaker, ren
 
 SYSTEM_PROMPT = """You review a diarized transcript that may have errors.
 
-Two tasks:
-1) SPEAKER CORRECTION — flip speaker label on whole utterances that look wrong.
-2) SPLIT — when one utterance clearly contains multiple speaker turns merged together,
+Two tasks (in priority order):
+1) SPLIT — when one utterance clearly contains multiple speaker turns merged together,
    split it into parts. Each part gets its own speaker label.
+2) SPEAKER CORRECTION — flip speaker label on a whole utterance ONLY when you are very sure.
 
 Rules:
 - Do NOT rewrite, translate, or paraphrase text.
 - For splits: copy text verbatim from the original utterance into parts.
 - Parts must concatenate to the full original utterance (same words, only split).
-- Use dialogue cues: Q&A, names, self-reference, style shifts, turn-taking.
+- Prefer SPLIT over CORRECTION for long utterances (>20 seconds or >120 characters).
+- Only correct a whole utterance when pronouns, names, or turn-taking clearly prove the label is wrong.
+- "don Jesús" / "Don Jesús" in text usually means the speaker is NOT Jesús (they talk about him).
+- "me dijo su mamá" / "dígale a Don Jesús" — track who reports vs who is mentioned; do not flip on weak guesses.
+- Short backchannel lines ("sí", "claro", "exacto", "órale") belong to the listener, not the talker.
+- If unsure, return nothing for that utterance. False changes are worse than leaving the label.
 - Speakers are labeled Speaker A, Speaker B, Speaker C, etc.
 - Return JSON only, no markdown.
 
@@ -44,7 +49,7 @@ Output schema:
 }
 
 Include only utterances you would change. confidence is 0.0 to 1.0.
-Prefer splits for long utterances with obvious turn changes inside."""
+Use confidence >= 0.90 only for whole-utterance corrections. Splits can be 0.80+."""
 
 
 def load_azure_openai_config() -> dict:
@@ -79,6 +84,98 @@ def _texts_match(original: str, parts: list[dict]) -> bool:
     if a == b:
         return True
     return SequenceMatcher(None, a, b).ratio() >= 0.95
+
+
+def _utterance_duration(utt: dict) -> float:
+    return max(float(utt.get("end", 0)) - float(utt.get("start", 0)), 0.0)
+
+
+# Third-person references to a named party — flipping TO that party is usually wrong.
+_NAMED_PARTY_RE = re.compile(r"\b(don|doña)\s+[a-záéíóúñ]+", re.IGNORECASE)
+_SHORT_BACKCHANNEL_RE = re.compile(
+    r"^(sí|si|claro|exacto|órale|ora(le)?|ajá|bueno|listo|ok|okey|mm[- ]?hm|jeje+)\b",
+    re.IGNORECASE,
+)
+
+
+def _reject_correction_reason(utt: dict, corr: dict, utterances: list[dict]) -> str | None:
+    """Return rejection reason, or None if correction may be applied."""
+    uid = utt["id"]
+    conf = corr.get("confidence", 0.0)
+    text = utt.get("text", "")
+    old = utt["speaker_label"]
+    new = corr["corrected_speaker"]
+    duration = _utterance_duration(utt)
+
+    if old == new:
+        return "same label"
+
+    # Long blocks should be split, not flipped.
+    if duration > 25 or len(text) > 200:
+        if conf < 0.95:
+            return f"long utterance ({duration:.0f}s) — split instead of flip"
+
+    by_id = {u["id"]: u for u in utterances}
+    idx = next((i for i, u in enumerate(utterances) if u["id"] == uid), None)
+    if idx is not None:
+        prev_label = utterances[idx - 1]["speaker_label"] if idx > 0 else None
+        next_label = utterances[idx + 1]["speaker_label"] if idx < len(utterances) - 1 else None
+        if prev_label == next_label == old and conf < 0.93:
+            return "sandwiched same speaker — likely merge, not flip"
+
+    # Very short backchannels rarely need a flip unless very confident.
+    if len(text.split()) <= 4 and _SHORT_BACKCHANNEL_RE.match(text.strip()) and conf < 0.90:
+        return "short backchannel — skip flip"
+
+    # Direct report to "usted" — usually the reporter is the current speaker.
+    if re.search(r"\bme dijo\b", text, re.IGNORECASE) and re.search(r"\busted\b", text, re.IGNORECASE):
+        if conf < 0.94:
+            return "reporting speech to usted — likely correct speaker"
+
+    # Talking about Don/Doña by name — usually not that person speaking.
+    if _NAMED_PARTY_RE.search(text) and conf < 0.94:
+        return "third-person honorific reference — likely correct speaker"
+
+    return None
+
+
+def filter_corrections(
+    utterances: list[dict],
+    corrections: list[dict],
+    *,
+    confidence_threshold: float,
+    skip_utterance_ids: set[int] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Keep only corrections that pass confidence + safety checks."""
+    skip = skip_utterance_ids or set()
+    by_id = {u["id"]: u for u in utterances}
+    kept: list[dict] = []
+    rejected: list[dict] = []
+
+    for corr in corrections:
+        uid = corr["utterance_id"]
+        if uid in skip:
+            rejected.append({**corr, "status": "rejected", "reject_reason": "utterance was split"})
+            continue
+        if uid not in by_id:
+            rejected.append({**corr, "status": "rejected", "reject_reason": "unknown utterance id"})
+            continue
+        if corr.get("confidence", 0) < confidence_threshold:
+            rejected.append({
+                **corr,
+                "status": "rejected",
+                "reject_reason": f"below threshold ({confidence_threshold:.0%})",
+            })
+            continue
+
+        reason = _reject_correction_reason(by_id[uid], corr, utterances)
+        if reason:
+            rejected.append({**corr, "status": "rejected", "reject_reason": reason})
+            continue
+
+        kept.append(corr)
+
+    return kept, rejected
 
 
 def postprocess_with_llm(
@@ -171,27 +268,28 @@ def apply_corrections(
     utterances: list[dict],
     corrections: list[dict],
     *,
-    confidence_threshold: float = 0.75,
-) -> tuple[list[dict], list[dict]]:
+    confidence_threshold: float = 0.88,
+    skip_utterance_ids: set[int] | None = None,
+) -> tuple[list[dict], list[dict], list[dict]]:
     """
-    Apply LLM corrections above threshold.
+    Apply LLM corrections that pass safety filters.
 
-    Returns (corrected_utterances, applied_flips_log)
+    Returns (corrected_utterances, applied_flips_log, rejected_log)
     """
+    filtered, rejected = filter_corrections(
+        utterances,
+        corrections,
+        confidence_threshold=confidence_threshold,
+        skip_utterance_ids=skip_utterance_ids,
+    )
+
     by_id = {u["id"]: dict(u) for u in utterances}
     flips = []
 
-    for corr in corrections:
+    for corr in filtered:
         uid = corr["utterance_id"]
-        if uid not in by_id:
-            continue
-        if corr["confidence"] < confidence_threshold:
-            continue
-
         old = by_id[uid]["speaker_label"]
         new = corr["corrected_speaker"]
-        if old == new:
-            continue
 
         by_id[uid]["speaker_label"] = new
         by_id[uid]["speaker"] = letter_to_speaker(speaker_to_letter(new))
@@ -204,7 +302,7 @@ def apply_corrections(
         })
 
     corrected = [by_id[u["id"]] for u in utterances]
-    return corrected, flips
+    return corrected, flips, rejected
 
 
 def apply_splits(
@@ -281,22 +379,40 @@ def postprocess_transcript(
     llm_result: dict,
     *,
     confidence_threshold: float = 0.75,
+    correction_confidence_threshold: float | None = None,
     enable_splits: bool = True,
     enable_corrections: bool = True,
-) -> tuple[list[dict], list[dict], list[dict]]:
-    """Apply splits first, then speaker label corrections. Returns (utterances, split_logs, flip_logs)."""
-    current = utterances
-    split_logs: list[dict] = []
-    flip_logs: list[dict] = []
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """
+    Apply conservative label fixes, then splits on merged blocks.
 
-    if enable_splits and llm_result.get("splits"):
-        current, split_logs = apply_splits(
-            current, llm_result["splits"], confidence_threshold=confidence_threshold,
-        )
+    Returns (utterances, split_logs, flip_logs, rejected_corrections)
+    """
+    split_threshold = confidence_threshold
+    flip_threshold = correction_confidence_threshold or max(confidence_threshold, 0.88)
+
+    pending_split_ids = {
+        s["utterance_id"]
+        for s in llm_result.get("splits", [])
+        if s.get("confidence", 0) >= split_threshold and len(s.get("parts", [])) >= 2
+    }
+
+    current = utterances
+    flip_logs: list[dict] = []
+    rejected: list[dict] = []
 
     if enable_corrections and llm_result.get("corrections"):
-        current, flip_logs = apply_corrections(
-            current, llm_result["corrections"], confidence_threshold=confidence_threshold,
+        current, flip_logs, rejected = apply_corrections(
+            current,
+            llm_result["corrections"],
+            confidence_threshold=flip_threshold,
+            skip_utterance_ids=pending_split_ids,
         )
 
-    return current, split_logs, flip_logs
+    split_logs: list[dict] = []
+    if enable_splits and llm_result.get("splits"):
+        current, split_logs = apply_splits(
+            current, llm_result["splits"], confidence_threshold=split_threshold,
+        )
+
+    return current, split_logs, flip_logs, rejected
