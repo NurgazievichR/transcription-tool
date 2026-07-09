@@ -130,9 +130,51 @@ def poll_transcription(transcript_id: str, config: dict, on_progress=None) -> di
         time.sleep(POLL_INTERVAL)
 
 
-def convert_results_to_segments(result: dict) -> list[dict]:
+def fetch_transcript(transcript_id: str, config: dict) -> dict:
+    """Fetch a completed transcript by ID (includes utterances + per-word speakers)."""
+    headers = _api_headers(config)
+    url = f"{ASSEMBLYAI_BASE_URL}/v2/transcript/{transcript_id}"
+    resp = _api_request("GET", url, headers, description="Fetch transcript")
+    if resp.status_code != 200:
+        raise RuntimeError(f"Fetch failed: {resp.status_code} {resp.text}")
+    result = resp.json()
+    if result.get("status") != "completed":
+        raise RuntimeError(f"Transcript not completed: {result.get('status')}")
+    return result
+
+
+def _map_speakers(result: dict) -> dict[str, str]:
+    speaker_map: dict[str, str] = {}
+    for utterance in result.get("utterances") or []:
+        label = utterance.get("speaker", "A")
+        if label not in speaker_map:
+            speaker_map[label] = f"SPEAKER_{len(speaker_map):02d}"
+    return speaker_map
+
+
+def extract_words(result: dict) -> list[dict]:
+    """Flatten per-word speaker labels from AssemblyAI utterances."""
+    words: list[dict] = []
+    for utterance in result.get("utterances") or []:
+        fallback_speaker = utterance.get("speaker", "A")
+        for word in utterance.get("words") or []:
+            text = (word.get("text") or "").strip()
+            if not text:
+                continue
+            words.append({
+                "text": text,
+                "start": word.get("start", 0),
+                "end": word.get("end", 0),
+                "speaker": word.get("speaker") or fallback_speaker,
+                "confidence": word.get("confidence", 0.0),
+            })
+    words.sort(key=lambda w: (w["start"], w["end"]))
+    return words
+
+
+def segments_from_utterances(result: dict) -> list[dict]:
     segments = []
-    speaker_map = {}
+    speaker_map = _map_speakers(result)
 
     for utterance in result.get("utterances") or []:
         text = utterance.get("text", "").strip()
@@ -140,9 +182,6 @@ def convert_results_to_segments(result: dict) -> list[dict]:
             continue
 
         speaker_label = utterance.get("speaker", "A")
-        if speaker_label not in speaker_map:
-            speaker_map[speaker_label] = f"SPEAKER_{len(speaker_map):02d}"
-
         segments.append({
             "start": round(utterance.get("start", 0) / 1000.0, 3),
             "end": round(utterance.get("end", 0) / 1000.0, 3),
@@ -151,6 +190,122 @@ def convert_results_to_segments(result: dict) -> list[dict]:
         })
 
     return segments
+
+
+def segments_from_words(
+    result: dict,
+    *,
+    pause_ms: int = 700,
+    max_segment_s: float = 45.0,
+) -> list[dict]:
+    """
+    Rebuild segments from per-word speaker labels.
+
+    Splits when the speaker changes, on long pauses, or when a segment exceeds max_segment_s.
+    """
+    words = extract_words(result)
+    if not words:
+        return segments_from_utterances(result)
+
+    speaker_map = _map_speakers(result)
+    segments: list[dict] = []
+    chunk_words: list[dict] = []
+    chunk_speaker: str | None = None
+    chunk_start_ms: int | None = None
+    last_end_ms: int | None = None
+
+    def flush():
+        nonlocal chunk_words, chunk_speaker, chunk_start_ms, last_end_ms
+        if not chunk_words or chunk_speaker is None:
+            chunk_words = []
+            chunk_speaker = None
+            chunk_start_ms = None
+            last_end_ms = None
+            return
+        text = " ".join(w["text"] for w in chunk_words).strip()
+        if text:
+            segments.append({
+                "start": round(chunk_start_ms / 1000.0, 3),
+                "end": round(chunk_words[-1]["end"] / 1000.0, 3),
+                "text": text,
+                "speaker": speaker_map.get(chunk_speaker, f"SPEAKER_{chunk_speaker}"),
+            })
+        chunk_words = []
+        chunk_speaker = None
+        chunk_start_ms = None
+        last_end_ms = None
+
+    for word in words:
+        speaker = word["speaker"]
+        start_ms = int(word["start"])
+        end_ms = int(word["end"])
+        pause = (start_ms - last_end_ms) if last_end_ms is not None else 0
+        duration_s = (end_ms - (chunk_start_ms or start_ms)) / 1000.0
+
+        new_turn = (
+            chunk_speaker is not None
+            and (
+                speaker != chunk_speaker
+                or pause >= pause_ms
+                or duration_s >= max_segment_s
+            )
+        )
+        if new_turn:
+            flush()
+
+        if chunk_speaker is None:
+            chunk_speaker = speaker
+            chunk_start_ms = start_ms
+        chunk_words.append(word)
+        last_end_ms = end_ms
+
+    flush()
+    return segments
+
+
+def convert_results_to_segments(
+    result: dict,
+    *,
+    segmentation: str = "utterances",
+    pause_ms: int = 700,
+) -> list[dict]:
+    if segmentation == "utterances":
+        return segments_from_utterances(result)
+    return segments_from_words(result, pause_ms=pause_ms)
+
+
+def package_transcription_result(
+    api_result: dict,
+    *,
+    duration: float,
+    filename: str,
+    speakers_expected: int | None,
+    segmentation: str = "utterances",
+    pause_ms: int = 700,
+) -> dict:
+    segments = convert_results_to_segments(api_result, segmentation=segmentation, pause_ms=pause_ms)
+    if not segments:
+        raise RuntimeError("No speech detected in the file")
+
+    segments_utterance = segments_from_utterances(api_result)
+    words = extract_words(api_result)
+    num_speakers = len({seg["speaker"] for seg in segments})
+    detected = api_result.get("language_code", "en")
+    language = detected.split("_")[0] if detected else "en"
+
+    return {
+        "segments": segments,
+        "segments_utterance": segments_utterance,
+        "duration": duration,
+        "language": language,
+        "num_speakers": num_speakers,
+        "filename": filename,
+        "transcript_id": api_result.get("id"),
+        "speakers_expected": speakers_expected,
+        "segmentation": segmentation,
+        "word_count": len(words),
+        "utterance_count": len(segments_utterance),
+    }
 
 
 def get_audio_duration_ffprobe(audio_path: str) -> float:
@@ -171,7 +326,9 @@ def get_audio_duration_ffprobe(audio_path: str) -> float:
 def transcribe_assemblyai(audio_path: str, config: dict,
                           locale: str = "en-US",
                           speakers_expected: int | None = None,
-                          on_progress=None) -> dict:
+                          on_progress=None,
+                          segmentation: str = "utterances",
+                          pause_ms: int = 700) -> dict:
     audio_path = Path(audio_path)
     language_code = None if locale == "auto" else _locale_to_assemblyai_code(locale)
 
@@ -197,25 +354,16 @@ def transcribe_assemblyai(audio_path: str, config: dict,
     on_progress(f"Job ID: `{transcript_id}`")
 
     on_progress("**[4/4] Waiting for result...**")
-    result = poll_transcription(transcript_id, config, on_progress)
+    api_result = poll_transcription(transcript_id, config, on_progress)
 
-    segments = convert_results_to_segments(result)
-    if not segments:
-        raise RuntimeError("No speech detected in the file")
-
-    num_speakers = len({seg["speaker"] for seg in segments})
-    detected = result.get("language_code", language_code or "en")
-    language = detected.split("_")[0] if detected else "en"
-
-    return {
-        "segments": segments,
-        "duration": duration,
-        "language": language,
-        "num_speakers": num_speakers,
-        "filename": audio_path.name,
-        "transcript_id": transcript_id,
-        "speakers_expected": speakers_expected,
-    }
+    return package_transcription_result(
+        api_result,
+        duration=duration,
+        filename=audio_path.name,
+        speakers_expected=speakers_expected,
+        segmentation=segmentation,
+        pause_ms=pause_ms,
+    )
 
 
 def load_assemblyai_config() -> dict:

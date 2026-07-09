@@ -178,17 +178,86 @@ def filter_corrections(
     return kept, rejected
 
 
+def filter_splits(
+    utterances: list[dict],
+    splits: list[dict],
+    *,
+    confidence_threshold: float,
+    min_duration_s: float = 12.0,
+) -> tuple[list[dict], list[dict]]:
+    """Keep splits that pass confidence, text match, and sanity checks."""
+    by_id = {u["id"]: u for u in utterances}
+    kept: list[dict] = []
+    rejected: list[dict] = []
+
+    for spec in splits:
+        uid = spec.get("utterance_id")
+        if uid not in by_id:
+            rejected.append({**spec, "status": "rejected", "reject_reason": "unknown utterance id"})
+            continue
+        if spec.get("confidence", 0) < confidence_threshold:
+            rejected.append({
+                **spec,
+                "status": "rejected",
+                "reject_reason": f"below threshold ({confidence_threshold:.0%})",
+            })
+            continue
+        parts = spec.get("parts") or []
+        if len(parts) < 2:
+            rejected.append({**spec, "status": "rejected", "reject_reason": "need 2+ parts"})
+            continue
+
+        speakers = {p.get("speaker") for p in parts}
+        if len(speakers) < 2:
+            rejected.append({**spec, "status": "rejected", "reject_reason": "all parts same speaker"})
+            continue
+
+        utt = by_id[uid]
+        if _utterance_duration(utt) < min_duration_s:
+            rejected.append({
+                **spec,
+                "status": "rejected",
+                "reject_reason": f"utterance shorter than {min_duration_s:.0f}s",
+            })
+            continue
+
+        if not _texts_match(utt["text"], parts):
+            rejected.append({**spec, "status": "rejected", "reject_reason": "split text mismatch"})
+            continue
+
+        kept.append(spec)
+
+    return kept, rejected
+
+
+def utterances_for_gpt(
+    utterances: list[dict],
+    *,
+    min_duration_s: float = 12.0,
+    min_chars: int = 120,
+) -> list[dict]:
+    """Only send long / likely-merged blocks to GPT."""
+    return [
+        u for u in utterances
+        if _utterance_duration(u) >= min_duration_s or len(u.get("text", "")) >= min_chars
+    ]
+
+
 def postprocess_with_llm(
     utterances: list[dict],
     *,
     expected_speakers: int | None = None,
     config: dict | None = None,
+    only_long: bool = True,
 ) -> dict:
     """Send numbered transcript to GPT-4o; get speaker corrections and split suggestions."""
+    target = utterances_for_gpt(utterances) if only_long else utterances
+    if not target:
+        return {"corrections": [], "splits": [], "raw_response": "{}"}
     if config is None:
         config = load_azure_openai_config()
 
-    numbered = format_numbered_transcript(utterances)
+    numbered = format_numbered_transcript(target)
     speaker_hint = (
         f"Expected speaker count: {expected_speakers}."
         if expected_speakers
@@ -411,8 +480,14 @@ def postprocess_transcript(
 
     split_logs: list[dict] = []
     if enable_splits and llm_result.get("splits"):
+        filtered_splits, split_rejected = filter_splits(
+            current,
+            llm_result["splits"],
+            confidence_threshold=split_threshold,
+        )
+        rejected.extend(split_rejected)
         current, split_logs = apply_splits(
-            current, llm_result["splits"], confidence_threshold=split_threshold,
+            current, filtered_splits, confidence_threshold=0.0,
         )
 
     return current, split_logs, flip_logs, rejected

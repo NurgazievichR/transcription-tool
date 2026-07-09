@@ -78,13 +78,13 @@ with st.sidebar:
         "Split merged utterances (GPT)",
         value=True,
         disabled=not enable_gpt,
-        help="If one block contains multiple speaker turns, GPT can split it into shorter parts.",
+        help="GPT may split long blocks only (>12s). Word-level segmentation handles most turns first.",
     )
     enable_gpt_corrections = st.checkbox(
         "Fix speaker labels (GPT)",
-        value=True,
+        value=False,
         disabled=not enable_gpt,
-        help="Flip Speaker A/B where dialogue context suggests the label is wrong.",
+        help="Off by default — flips often hurt accuracy. Prefer splits only.",
     )
     gpt_confidence = st.slider(
         "GPT split threshold",
@@ -103,6 +103,13 @@ with st.sidebar:
         step=0.05,
         disabled=not enable_gpt or not enable_gpt_corrections,
         help="Higher bar for flipping a whole utterance — reduces false corrections.",
+    )
+
+    st.divider()
+    word_segmentation = st.checkbox(
+        "Word-level segmentation (experimental)",
+        value=False,
+        help="Splits on pauses between words. Does NOT fix merged speakers — AssemblyAI uses one speaker per utterance for all words.",
     )
 
     st.divider()
@@ -169,9 +176,14 @@ if run:
                     locale=locale,
                     speakers_expected=speakers_expected,
                     on_progress=lambda msg: status.write(msg),
+                    segmentation="words" if word_segmentation else "utterances",
                 )
 
             raw_utterances = structure_segments(result["segments"])
+            status.write(
+                f"Segments: **{len(raw_utterances)}** "
+                f"({'word-level' if word_segmentation else 'utterance-level'})"
+            )
             corrected_utterances = raw_utterances
             flips: list[dict] = []
             split_logs: list[dict] = []
@@ -184,6 +196,7 @@ if run:
                     raw_utterances,
                     expected_speakers=expected_for_gpt,
                     config=load_azure_openai_config(),
+                    only_long=True,
                 )
                 corrected_utterances, split_logs, flips, rejected_flips = postprocess_transcript(
                     raw_utterances,
