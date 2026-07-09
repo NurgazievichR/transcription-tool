@@ -122,6 +122,9 @@ with col1:
 
 run = st.button("Transcribe", type="primary", disabled=not uploaded)
 
+if "transcript_result" not in st.session_state:
+    st.session_state.transcript_result = None
+
 
 def _utterances_to_export(utterances: list[dict], meta: dict, variant: str) -> dict:
     return {
@@ -193,71 +196,94 @@ if run:
             "speakers_mode": "auto" if auto_speakers else f"manual ({manual_speakers})",
         }
 
-        cols = st.columns(5 if enable_gpt and azure_ok else 4)
-        cols[0].metric("Utterances (raw)", len(raw_utterances))
-        i = 1
-        if enable_gpt and azure_ok:
-            cols[i].metric("Utterances (GPT)", len(corrected_utterances))
-            i += 1
-        cols[i].metric("Speakers", result["num_speakers"])
-        cols[i + 1].metric("Duration", format_duration(result["duration"]))
-        cols[i + 2].metric("Speakers mode", "Auto" if auto_speakers else str(manual_speakers))
-
-        view_options = ["AssemblyAI (raw)"]
-        if enable_gpt and azure_ok:
-            view_options.append("GPT corrected")
-
-        view = st.radio("Transcript view", view_options, horizontal=True)
-        active = corrected_utterances if view == "GPT corrected" else raw_utterances
-
-        st.subheader(view)
-        numbered = format_numbered_transcript(active)
-        st.text_area(
-            "Numbered transcript",
-            numbered,
-            height=420,
-            label_visibility="collapsed",
-        )
-
-        if view == "GPT corrected":
-            applied_splits = [s for s in split_logs if s.get("status") == "applied"]
-            if applied_splits:
-                with st.expander(f"Splits applied ({len(applied_splits)})"):
-                    for item in applied_splits:
-                        st.markdown(
-                            f"- **#{item['utterance_id']}** → **{item['to_utterances']}** parts "
-                            f"({item['confidence']:.0%}) — {item.get('reason', '')}"
-                        )
-            if flips:
-                with st.expander(f"Speaker label changes ({len(flips)})"):
-                    for flip in flips:
-                        st.markdown(
-                            f"- **#{flip['utterance_id']}**: {flip['from']} → {flip['to']} "
-                            f"({flip['confidence']:.0%}) — {flip.get('reason', '')}"
-                        )
-
-        stem = Path(uploaded.name).stem
-        export = _utterances_to_export(active, meta, variant=view)
-        json_bytes = json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8")
-        txt_bytes = numbered.encode("utf-8")
-
-        dl1, dl2 = st.columns(2)
-        suffix_tag = "gpt" if view == "GPT corrected" else "raw"
-        with dl1:
-            st.download_button(
-                "Download JSON",
-                data=json_bytes,
-                file_name=f"{stem}_{suffix_tag}.json",
-                mime="application/json",
-            )
-        with dl2:
-            st.download_button(
-                "Download TXT",
-                data=txt_bytes,
-                file_name=f"{stem}_{suffix_tag}.txt",
-                mime="text/plain",
-            )
+        st.session_state.transcript_result = {
+            "filename": uploaded.name,
+            "meta": meta,
+            "raw_utterances": raw_utterances,
+            "corrected_utterances": corrected_utterances,
+            "flips": flips,
+            "split_logs": split_logs,
+            "gpt_enabled": enable_gpt and azure_ok,
+        }
 
     except Exception as e:
         status.update(label="Error", state="error", expanded=True)
         st.error(str(e))
+
+
+def _render_transcript_results(data: dict) -> None:
+    meta = data["meta"]
+    raw_utterances = data["raw_utterances"]
+    corrected_utterances = data["corrected_utterances"]
+    flips = data["flips"]
+    split_logs = data["split_logs"]
+    gpt_enabled = data["gpt_enabled"]
+
+    cols = st.columns(5 if gpt_enabled else 4)
+    cols[0].metric("Utterances (raw)", len(raw_utterances))
+    i = 1
+    if gpt_enabled:
+        cols[i].metric("Utterances (GPT)", len(corrected_utterances))
+        i += 1
+    cols[i].metric("Speakers", meta["num_speakers"])
+    cols[i + 1].metric("Duration", format_duration(meta["duration"]))
+    cols[i + 2].metric("Speakers mode", meta["speakers_mode"])
+
+    view_options = ["AssemblyAI (raw)"]
+    if gpt_enabled:
+        view_options.append("GPT corrected")
+
+    view = st.radio("Transcript view", view_options, horizontal=True)
+    active = corrected_utterances if view == "GPT corrected" else raw_utterances
+
+    st.subheader(view)
+    numbered = format_numbered_transcript(active)
+    st.text_area(
+        "Numbered transcript",
+        numbered,
+        height=420,
+        label_visibility="collapsed",
+    )
+
+    if view == "GPT corrected":
+        applied_splits = [s for s in split_logs if s.get("status") == "applied"]
+        if applied_splits:
+            with st.expander(f"Splits applied ({len(applied_splits)})"):
+                for item in applied_splits:
+                    st.markdown(
+                        f"- **#{item['utterance_id']}** → **{item['to_utterances']}** parts "
+                        f"({item['confidence']:.0%}) — {item.get('reason', '')}"
+                    )
+        if flips:
+            with st.expander(f"Speaker label changes ({len(flips)})"):
+                for flip in flips:
+                    st.markdown(
+                        f"- **#{flip['utterance_id']}**: {flip['from']} → {flip['to']} "
+                        f"({flip['confidence']:.0%}) — {flip.get('reason', '')}"
+                    )
+
+    stem = Path(data["filename"]).stem
+    export = _utterances_to_export(active, meta, variant=view)
+    json_bytes = json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8")
+    txt_bytes = numbered.encode("utf-8")
+
+    dl1, dl2 = st.columns(2)
+    suffix_tag = "gpt" if view == "GPT corrected" else "raw"
+    with dl1:
+        st.download_button(
+            "Download JSON",
+            data=json_bytes,
+            file_name=f"{stem}_{suffix_tag}.json",
+            mime="application/json",
+        )
+    with dl2:
+        st.download_button(
+            "Download TXT",
+            data=txt_bytes,
+            file_name=f"{stem}_{suffix_tag}.txt",
+            mime="text/plain",
+        )
+
+
+if st.session_state.transcript_result:
+    _render_transcript_results(st.session_state.transcript_result)
