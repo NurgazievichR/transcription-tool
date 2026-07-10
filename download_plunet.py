@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Download source media from Plunet with readable terminal progress."""
+"""Download source media from Plunet with readable terminal progress.
 
+Usage:
+  python download_plunet.py O-12345 "\\source\\en-us\\interview.wav"
+  python download_plunet.py O-12345 "\\source\\en-us\\a.wav" "\\source\\en-us\\b.mp4"
+"""
+
+import argparse
 import sys
 import time
 from pathlib import Path
 
 from config import AUDIO_EXTENSIONS, load_config
 from plunet_order_client import PlunetOrderClient
-
-# Smaller files first. expected_bytes from prior Plunet probes (None = unknown).
-DOWNLOAD_QUEUE = [
-    ("O-33603", r"\source\es-mx\Recordings-0000000248.wav", 76_341_298),
-    ("O-33603", r"\source\es-mx\Recordings-0000000246.wav", 16_760_882),
-    ("O-33603", r"\source\es-mx\Recordings-0000000249.wav", None),
-    ("O-33687", r"\source\en-us\Axon_Interview-Internal_Affairs-Interrogation_Room-Dome_Cam.mp4", 254_000_000),
-    ("O-33693", r"\source\en-us\TFC_Messick_Interview July 29 2025.mp4", 171_000_000),
-]
 
 OUTPUT_DIR = Path(__file__).parent / "downloads"
 PROGRESS_INTERVAL_SEC = 3.0
@@ -108,28 +105,24 @@ class TerminalProgress:
         print(f"{self.label}\n  FAILED: {err}\n", flush=True)
 
 
-def _print_queue_plan(queue: list, output_dir: Path) -> None:
-    print("Queue:")
-    for idx, (order_name, file_path, expected_size) in enumerate(queue, 1):
-        name = Path(file_path.replace("\\", "/")).name
-        out_path = output_dir / order_name / name
-        if out_path.exists() and out_path.stat().st_size > 0:
-            status = f"skip (exists, {_fmt_bytes(out_path.stat().st_size)})"
-        else:
-            size_hint = f"~{_fmt_bytes(expected_size)}" if expected_size else "size unknown"
-            status = f"download ({size_hint})"
-        print(f"  {idx}. {order_name} / {name}  —  {status}")
-    print()
-
-
 def main():
+    parser = argparse.ArgumentParser(description="Download source media from Plunet")
+    parser.add_argument("order", help="Order name, e.g. O-12345")
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help=r'Plunet source path(s), e.g. "\source\en-us\file.wav"',
+    )
+    args = parser.parse_args()
+
     cfg = load_config()["plunet"]
     if not all(cfg.values()):
         print("Missing PLUNET_* credentials in .env", file=sys.stderr)
         sys.exit(1)
 
+    queue = [(args.order, path, None) for path in args.paths]
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    total_files = len(DOWNLOAD_QUEUE)
+    total_files = len(queue)
     ok = 0
     failed = 0
     skipped = 0
@@ -138,7 +131,10 @@ def main():
     print(f"Plunet download -> {OUTPUT_DIR.resolve()}")
     print(f"Started {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
-    _print_queue_plan(DOWNLOAD_QUEUE, OUTPUT_DIR)
+    print("Queue:")
+    for idx, (order_name, file_path, _) in enumerate(queue, 1):
+        print(f"  {idx}. {order_name} / {Path(file_path.replace(chr(92), '/')).name}")
+    print()
 
     client = PlunetOrderClient(cfg["base_url"], cfg["username"], cfg["password"])
     tok = client.login()
@@ -147,7 +143,7 @@ def main():
         sys.exit(1)
     print("Plunet login OK\n")
 
-    for idx, (order_name, file_path, expected_size) in enumerate(DOWNLOAD_QUEUE, 1):
+    for idx, (order_name, file_path, expected_size) in enumerate(queue, 1):
         name = Path(file_path.replace("\\", "/")).name
         ext = Path(name).suffix.lower()
         if ext not in AUDIO_EXTENSIONS:

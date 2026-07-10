@@ -1,8 +1,0 @@
--------------------------------------------------------------------------------
-Quick reference
--------------------------------------------------------------------------------
-Order     | Reference .docx                                      | Speakers / lang
-----------|------------------------------------------------------|------------------
-O-33693   | TFC_Messick_Interview July 29 2025 - ENG.docx        | EN, multi
-O-33687   | Axon_Interview-...-Dome_Cam - ENG.docx               | EN, multi
-O-33603   | Recordings-0000000248_SPA - EDT_EN 6.11.26 - SPA-ENG | SPA+EN, multi

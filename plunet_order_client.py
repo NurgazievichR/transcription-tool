@@ -6,8 +6,6 @@ Provides authenticated access to Plunet orders via three SOAP services:
 - DataOrder30 — order lookup and file listing
 - DataDocument30 — file download
 
-Adapted from AdAstraQuote's plunet_client.py retry/session patterns
-and download_order_files.ipynb logic.
 """
 
 import sys
