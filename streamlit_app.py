@@ -15,6 +15,7 @@ from llm_speaker_correct import (
     postprocess_transcript,
     postprocess_with_llm,
 )
+from export_docx import build_transcript_docx
 from transcript_format import format_numbered_transcript, structure_segments
 from utils import format_duration
 
@@ -301,17 +302,28 @@ def _render_transcript_results(data: dict) -> None:
     export = _utterances_to_export(active, meta, variant=view)
     json_bytes = json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8")
     txt_bytes = numbered.encode("utf-8")
+    docx_bytes = build_transcript_docx(
+        active,
+        title=f"{data['filename']} — {view}",
+    )
 
-    dl1, dl2 = st.columns(2)
+    dl1, dl2, dl3 = st.columns(3)
     suffix_tag = "gpt" if view == "GPT corrected" else "raw"
     with dl1:
+        st.download_button(
+            "Download DOCX",
+            data=docx_bytes,
+            file_name=f"{stem}_{suffix_tag}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    with dl2:
         st.download_button(
             "Download JSON",
             data=json_bytes,
             file_name=f"{stem}_{suffix_tag}.json",
             mime="application/json",
         )
-    with dl2:
+    with dl3:
         st.download_button(
             "Download TXT",
             data=txt_bytes,
